@@ -265,6 +265,11 @@ namespace {
       info.setNullabilityAudited(static_cast<NullabilityKind>(*data));
     }
     ++data;
+
+    auto typeLen
+      = endian::readNext<uint16_t, little, unaligned>(data);
+    info.setType(std::string(data, data + typeLen));
+    data += typeLen;
   }
 
   /// Used to deserialize the on-disk Objective-C property table.
@@ -285,9 +290,23 @@ namespace {
                                             const uint8_t *&data) {
       ObjCPropertyInfo info;
       readVariableInfo(data, info);
+      uint8_t flags = *data++;
+      if (flags & (1 << 0))
+        info.setSwiftImportAsAccessors(flags & (1 << 1));
       return info;
     }
   };
+
+  /// Read serialized ParamInfo.
+  void readParamInfo(const uint8_t *&data, ParamInfo &info) {
+    readVariableInfo(data, info);
+
+    uint8_t payload = endian::readNext<uint8_t, little, unaligned>(data);
+    if (payload & 0x01) {
+      info.setNoEscape(payload & 0x02);
+    }
+    payload >>= 2; assert(payload == 0 && "Bad API notes");
+  }
 
   /// Read serialized FunctionInfo.
   void readFunctionInfo(const uint8_t *&data, FunctionInfo &info) {
@@ -301,21 +320,16 @@ namespace {
 
     unsigned numParams = endian::readNext<uint16_t, little, unaligned>(data);
     while (numParams > 0) {
-      uint8_t payload = endian::readNext<uint8_t, little, unaligned>(data);
-
       ParamInfo pi;
-      uint8_t nullabilityValue = payload & 0x3; payload >>= 2;
-      if (payload & 0x01)
-        pi.setNullabilityAudited(static_cast<NullabilityKind>(nullabilityValue));
-      payload >>= 1;
-      if (payload & 0x01) {
-        pi.setNoEscape(payload & 0x02);
-      }
-      payload >>= 2; assert(payload == 0 && "Bad API notes");
-
+      readParamInfo(data, pi);
       info.Params.push_back(pi);
       --numParams;
     }
+
+    unsigned resultTypeLen
+      = endian::readNext<uint16_t, little, unaligned>(data);
+    info.ResultType = std::string(data, data + resultTypeLen);
+    data += resultTypeLen;
   }
 
   /// Used to deserialize the on-disk Objective-C method table.

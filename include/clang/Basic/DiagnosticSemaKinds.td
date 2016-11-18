@@ -357,6 +357,9 @@ def warn_decl_shadow :
           "static data member of %2|"
           "field of %2}1">,
   InGroup<Shadow>, DefaultIgnore;
+def warn_decl_shadow_uncaptured_local :
+  Warning<warn_decl_shadow.Text>,
+  InGroup<ShadowUncapturedLocal>, DefaultIgnore;
 def warn_ctor_parm_shadows_field:
   Warning<"constructor parameter %0 shadows the field %1 of %2">,
   InGroup<ShadowFieldInConstructor>, DefaultIgnore;
@@ -6238,6 +6241,8 @@ let CategoryName = "Lambda Issue" in {
   def note_lambda_to_block_conv : Note<
     "implicit capture of lambda object due to conversion to block pointer "
     "here">;
+  def note_var_explicitly_captured_here : Note<"variable %0 is"
+    "%select{| explicitly}1 captured here">;
 
   // C++14 lambda init-captures.
   def warn_cxx11_compat_init_capture : Warning<
@@ -8152,6 +8157,13 @@ def err_opencl_enqueue_kernel_blocks_no_args : Error<
   "blocks in this form of device side enqueue call are expected to have have no parameters">;
 } // end of sema category
 
+let CategoryName = "API Notes Issue" in {
+
+def err_incompatible_replacement_type : Error<
+  "API notes replacement type %0 has a different size from original type %1">;
+
+}
+
 let CategoryName = "OpenMP Issue" in {
 // OpenMP support.
 def err_omp_expected_var_arg : Error<
@@ -8695,6 +8707,15 @@ def warn_nullability_missing : Warning<
   "%select{pointer|block pointer|member pointer}0 is missing a nullability "
   "type specifier (_Nonnull, _Nullable, or _Null_unspecified)">,
   InGroup<NullabilityCompleteness>;
+def warn_nullability_missing_array : Warning<
+  "array parameter is missing a nullability type specifier (_Nonnull, "
+  "_Nullable, or _Null_unspecified)">,
+  InGroup<NullabilityCompletenessOnArrays>;
+
+def warn_nullability_inferred_on_nested_type : Warning<
+  "inferring '_Nonnull' for pointer type within %select{array|reference}0 is "
+  "deprecated">,
+  InGroup<NullabilityInferredOnNestedType>;
 
 def err_objc_type_arg_explicit_nullability : Error<
   "type argument %0 cannot explicitly specify nullability">;

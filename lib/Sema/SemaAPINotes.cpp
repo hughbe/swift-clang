@@ -64,7 +64,7 @@ static void applyNullability(Sema &S, Decl *decl, NullabilityKind nullability,
   QualType origType = type;
   S.checkNullabilityTypeSpecifier(type, nullability, decl->getLocation(),
                                   /*isContextSensitive=*/false,
-                                  /*implicit=*/true,
+                                  isa<ParmVarDecl>(decl), /*implicit=*/true,
                                   overrideExisting);
   if (type.getTypePtr() == origType.getTypePtr())
     return;
@@ -131,8 +131,7 @@ namespace {
          Sema &S, Decl *D, bool shouldAddAttribute,
          VersionedInfoRole role,
          llvm::function_ref<A *()> createAttr,
-         llvm::function_ref<specific_attr_iterator<A>(Decl *)> getExistingAttr =
-           [](Decl *decl) { return decl->specific_attr_begin<A>(); }) {
+         llvm::function_ref<specific_attr_iterator<A>(Decl *)> getExistingAttr) {
     switch (role) {
     case VersionedInfoRole::AugmentSource:
       // If we're not adding an attribute, there's nothing to do.
@@ -170,6 +169,11 @@ namespace {
   }
 }
 
+template <typename Attr>
+static specific_attr_iterator<Attr> getAttrIterator(Decl *decl) {
+  return decl->specific_attr_begin<Attr>();
+}
+
 static void ProcessAPINotes(Sema &S, Decl *D,
                             const api_notes::CommonEntityInfo &info,
                             VersionedInfoRole role) {
@@ -180,7 +184,7 @@ static void ProcessAPINotes(Sema &S, Decl *D,
         return UnavailableAttr::CreateImplicit(S.Context,
                                                CopyString(S.Context,
                                                           info.UnavailableMsg));
-    });
+    }, getAttrIterator<UnavailableAttr>);
   }
 
   if (info.UnavailableInSwift) {
@@ -216,7 +220,7 @@ static void ProcessAPINotes(Sema &S, Decl *D,
   if (auto swiftPrivate = info.isSwiftPrivate()) {
     handleAPINotedAttribute<SwiftPrivateAttr>(S, D, *swiftPrivate, role, [&] {
       return SwiftPrivateAttr::CreateImplicit(S.Context);
-    });
+    }, getAttrIterator<SwiftPrivateAttr>);
   }
 
   // swift_name
@@ -233,7 +237,7 @@ static void ProcessAPINotes(Sema &S, Decl *D,
       return SwiftNameAttr::CreateImplicit(S.Context,
                                            CopyString(S.Context,
                                                       info.SwiftName));
-    });
+    }, getAttrIterator<SwiftNameAttr>);
   }
 }
 
@@ -247,7 +251,7 @@ static void ProcessAPINotes(Sema &S, Decl *D,
       return SwiftBridgeAttr::CreateImplicit(S.Context,
                                              CopyString(S.Context,
                                                         *swiftBridge));
-    });
+    }, getAttrIterator<SwiftBridgeAttr>);
   }
 
   // ns_error_domain
@@ -257,17 +261,69 @@ static void ProcessAPINotes(Sema &S, Decl *D,
       return NSErrorDomainAttr::CreateImplicit(
                S.Context,
                &S.Context.Idents.get(*nsErrorDomain));
-    });
+    }, getAttrIterator<NSErrorDomainAttr>);
   }
 
   ProcessAPINotes(S, D, static_cast<const api_notes::CommonEntityInfo &>(info),
                   role);
 }
 
+/// Check that the replacement type provided by API notes is reasonable.
+///
+/// This is a very weak form of ABI check.
+static bool checkAPINotesReplacementType(Sema &S, SourceLocation loc,
+                                         QualType origType,
+                                         QualType replacementType) {
+  if (S.Context.getTypeSize(origType) !=
+        S.Context.getTypeSize(replacementType)) {
+    S.Diag(loc, diag::err_incompatible_replacement_type)
+      << replacementType << origType;
+    return true;
+  }
+
+  return false;
+}
+
 /// Process API notes for a variable or property.
 static void ProcessAPINotes(Sema &S, Decl *D,
                             const api_notes::VariableInfo &info,
                             VersionedInfoRole role) {
+  // Type override.
+  if (role != VersionedInfoRole::Versioned &&
+      !info.getType().empty() && S.ParseTypeFromStringCallback) {
+    auto parsedType = S.ParseTypeFromStringCallback(info.getType(),
+                                                    "<API Notes>",
+                                                    D->getLocation());
+    if (parsedType.isUsable()) {
+      QualType type = Sema::GetTypeFromParser(parsedType.get());
+      auto typeInfo =
+        S.Context.getTrivialTypeSourceInfo(type, D->getLocation());
+
+      if (auto var = dyn_cast<VarDecl>(D)) {
+        // Make adjustments to parameter types.
+        if (isa<ParmVarDecl>(var)) {
+          type = S.adjustParameterTypeForObjCAutoRefCount(type,
+                                                          D->getLocation());
+          type = S.Context.getAdjustedParameterType(type);
+        }
+
+        if (!checkAPINotesReplacementType(S, var->getLocation(), var->getType(),
+                                          type)) {
+          var->setType(type);
+          var->setTypeSourceInfo(typeInfo);
+        }
+      } else if (auto property = dyn_cast<ObjCPropertyDecl>(D)) {
+        if (!checkAPINotesReplacementType(S, property->getLocation(),
+                                          property->getType(),
+                                          type)) {
+          property->setType(type, typeInfo);
+        }
+      } else {
+        llvm_unreachable("API notes allowed a type on an unknown declaration");
+      }
+    }
+  }
+
   // Nullability.
   if (auto Nullability = info.getNullability()) {
     applyNullability(S, D, *Nullability, role);
@@ -286,7 +342,7 @@ static void ProcessAPINotes(Sema &S, ParmVarDecl *D,
   if (auto noescape = info.isNoEscape()) {
     handleAPINotedAttribute<NoEscapeAttr>(S, D, *noescape, role, [&] {
       return NoEscapeAttr::CreateImplicit(S.Context);
-    });
+    }, getAttrIterator<NoEscapeAttr>);
   }
 
   // Handle common entity information.
@@ -310,6 +366,13 @@ static void ProcessAPINotes(Sema &S, ObjCPropertyDecl *D,
   // Handle common entity information.
   ProcessAPINotes(S, D, static_cast<const api_notes::VariableInfo &>(info),
                   role);
+  if (auto asAccessors = info.getSwiftImportAsAccessors()) {
+    handleAPINotedAttribute<SwiftImportPropertyAsAccessorsAttr>(S, D,
+                                                                *asAccessors,
+                                                                role, [&] {
+      return SwiftImportPropertyAsAccessorsAttr::CreateImplicit(S.Context);
+    }, getAttrIterator<SwiftImportPropertyAsAccessorsAttr>);
+  }
 }
 
 namespace {
@@ -340,20 +403,75 @@ static void ProcessAPINotes(Sema &S, FunctionOrMethod AnyFunc,
     NumParams = FD->getNumParams();
   else
     NumParams = MD->param_size();
-  
+
+  bool anyTypeChanged = false;
   for (unsigned I = 0; I != NumParams; ++I) {
     ParmVarDecl *Param;
     if (FD)
       Param = FD->getParamDecl(I);
     else
       Param = MD->param_begin()[I];
-    
+
+    QualType paramTypeBefore = Param->getType();
+
+    if (I < info.Params.size()) {
+      ProcessAPINotes(S, Param, info.Params[I], role);
+    }
+
     // Nullability.
     if (info.NullabilityAudited)
       applyNullability(S, Param, info.getParamTypeInfo(I), role);
 
-    if (I < info.Params.size()) {
-      ProcessAPINotes(S, Param, info.Params[I], role);
+    if (paramTypeBefore.getAsOpaquePtr() != Param->getType().getAsOpaquePtr())
+      anyTypeChanged = true;
+  }
+
+  // Result type override.
+  QualType overriddenResultType;
+  if (role != VersionedInfoRole::Versioned && !info.ResultType.empty() &&
+      S.ParseTypeFromStringCallback) {
+    auto parsedType = S.ParseTypeFromStringCallback(info.ResultType,
+                                                    "<API Notes>",
+                                                    D->getLocation());
+    if (parsedType.isUsable()) {
+      QualType resultType = Sema::GetTypeFromParser(parsedType.get());
+
+      if (MD) {
+        if (!checkAPINotesReplacementType(S, D->getLocation(),
+                                          MD->getReturnType(), resultType)) {
+          auto resultTypeInfo =
+            S.Context.getTrivialTypeSourceInfo(resultType, D->getLocation());
+          MD->setReturnType(resultType);
+          MD->setReturnTypeSourceInfo(resultTypeInfo);
+        }
+      } else if (!checkAPINotesReplacementType(S, FD->getLocation(),
+                                               FD->getReturnType(),
+                                               resultType)) {
+        overriddenResultType = resultType;
+        anyTypeChanged = true;
+      }
+    }
+  }
+
+  // If the result type or any of the parameter types changed for a function
+  // declaration, we have to rebuild the type.
+  if (FD && anyTypeChanged) {
+    if (const auto *fnProtoType = FD->getType()->getAs<FunctionProtoType>()) {
+      if (overriddenResultType.isNull())
+        overriddenResultType = fnProtoType->getReturnType();
+
+      SmallVector<QualType, 4> paramTypes;
+      for (auto param : FD->parameters()) {
+        paramTypes.push_back(param->getType());
+      }
+      FD->setType(S.Context.getFunctionType(overriddenResultType,
+                                            paramTypes,
+                                            fnProtoType->getExtProtoInfo()));
+    } else if (!overriddenResultType.isNull()) {
+      const auto *fnNoProtoType = FD->getType()->castAs<FunctionNoProtoType>();
+      FD->setType(
+              S.Context.getFunctionNoProtoType(overriddenResultType,
+                                               fnNoProtoType->getExtInfo()));
     }
   }
 
@@ -394,7 +512,7 @@ static void ProcessAPINotes(Sema &S, ObjCMethodDecl *D,
         IFace->setHasDesignatedInitializers();
       }
       return ObjCDesignatedInitializerAttr::CreateImplicit(S.Context);
-    });
+    }, getAttrIterator<ObjCDesignatedInitializerAttr>);
   }
 
   // FIXME: This doesn't work well with versioned API notes.
@@ -447,7 +565,7 @@ static void ProcessAPINotes(Sema &S, TypedefNameDecl *D,
                  S.Context,
                  SwiftNewtypeAttr::GNU_swift_wrapper,
                  kind);
-    });
+    }, getAttrIterator<SwiftNewtypeAttr>);
   }
 
   // Handle common type information.

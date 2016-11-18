@@ -6567,6 +6567,17 @@ static ShadowedDeclKind computeShadowedDeclKind(const NamedDecl *ShadowedDecl,
   return OldDC->isFileContext() ? SDK_Global : SDK_Local;
 }
 
+/// Return the location of the capture if the given lambda captures the given
+/// variable \p VD, or an invalid source location otherwise.
+static SourceLocation getCaptureLocation(const LambdaScopeInfo *LSI,
+                                         const VarDecl *VD) {
+  for (const LambdaScopeInfo::Capture &Capture : LSI->Captures) {
+    if (Capture.isVariableCapture() && Capture.getVariable() == VD)
+      return Capture.getLocation();
+  }
+  return SourceLocation();
+}
+
 /// \brief Diagnose variable or built-in function shadowing.  Implements
 /// -Wshadow.
 ///
@@ -6625,6 +6636,29 @@ void Sema::CheckShadow(Scope *S, VarDecl *D, const LookupResult& R) {
 
   DeclContext *OldDC = ShadowedDecl->getDeclContext();
 
+  unsigned WarningDiag = diag::warn_decl_shadow;
+  SourceLocation CaptureLoc;
+  if (isa<VarDecl>(ShadowedDecl) && NewDC && isa<CXXMethodDecl>(NewDC)) {
+    if (const auto *RD = dyn_cast<CXXRecordDecl>(NewDC->getParent())) {
+      if (RD->isLambda() && OldDC->Encloses(NewDC->getLexicalParent())) {
+        if (RD->getLambdaCaptureDefault() == LCD_None) {
+          // Try to avoid warnings for lambdas with an explicit capture list.
+          const auto *LSI = cast<LambdaScopeInfo>(getCurFunction());
+          // Warn only when the lambda captures the shadowed decl explicitly.
+          CaptureLoc = getCaptureLocation(LSI, cast<VarDecl>(ShadowedDecl));
+          if (CaptureLoc.isInvalid())
+            WarningDiag = diag::warn_decl_shadow_uncaptured_local;
+        } else {
+          // Remember that this was shadowed so we can avoid the warning if the
+          // shadowed decl isn't captured and the warning settings allow it.
+          cast<LambdaScopeInfo>(getCurFunction())
+              ->ShadowingDecls.push_back({D, cast<VarDecl>(ShadowedDecl)});
+          return;
+        }
+      }
+    }
+  }
+
   // Only warn about certain kinds of shadowing for class members.
   if (NewDC && NewDC->isRecord()) {
     // In particular, don't warn about shadowing non-class members.
@@ -6646,8 +6680,31 @@ void Sema::CheckShadow(Scope *S, VarDecl *D, const LookupResult& R) {
   if (getSourceManager().isInSystemMacro(R.getNameLoc()))
     return;
   ShadowedDeclKind Kind = computeShadowedDeclKind(ShadowedDecl, OldDC);
-  Diag(R.getNameLoc(), diag::warn_decl_shadow) << Name << Kind << OldDC;
+  Diag(R.getNameLoc(), WarningDiag) << Name << Kind << OldDC;
+  if (!CaptureLoc.isInvalid())
+    Diag(CaptureLoc, diag::note_var_explicitly_captured_here)
+        << Name << /*explicitly*/ 1;
   Diag(ShadowedDecl->getLocation(), diag::note_previous_declaration);
+}
+
+/// Diagnose shadowing for variables shadowed in the lambda record \p LambdaRD
+/// when these variables are captured by the lambda.
+void Sema::DiagnoseShadowingLambdaDecls(const LambdaScopeInfo *LSI) {
+  for (const auto &Shadow : LSI->ShadowingDecls) {
+    const VarDecl *ShadowedDecl = Shadow.ShadowedDecl;
+    // Try to avoid the warning when the shadowed decl isn't captured.
+    SourceLocation CaptureLoc = getCaptureLocation(LSI, ShadowedDecl);
+    const DeclContext *OldDC = ShadowedDecl->getDeclContext();
+    Diag(Shadow.VD->getLocation(), CaptureLoc.isInvalid()
+                                       ? diag::warn_decl_shadow_uncaptured_local
+                                       : diag::warn_decl_shadow)
+        << Shadow.VD->getDeclName()
+        << computeShadowedDeclKind(ShadowedDecl, OldDC) << OldDC;
+    if (!CaptureLoc.isInvalid())
+      Diag(CaptureLoc, diag::note_var_explicitly_captured_here)
+          << Shadow.VD->getDeclName() << /*explicitly*/ 0;
+    Diag(ShadowedDecl->getLocation(), diag::note_previous_declaration);
+  }
 }
 
 /// \brief Check -Wshadow without the advantage of a previous lookup.
@@ -11092,10 +11149,8 @@ void Sema::DiagnoseSizeOfParametersAndReturnValue(
   }
 }
 
-ParmVarDecl *Sema::CheckParameter(DeclContext *DC, SourceLocation StartLoc,
-                                  SourceLocation NameLoc, IdentifierInfo *Name,
-                                  QualType T, TypeSourceInfo *TSInfo,
-                                  StorageClass SC) {
+QualType Sema::adjustParameterTypeForObjCAutoRefCount(QualType T,
+                                                      SourceLocation Loc) {
   // In ARC, infer a lifetime qualifier for appropriate parameter types.
   if (getLangOpts().ObjCAutoRefCount &&
       T.getObjCLifetime() == Qualifiers::OCL_None &&
@@ -11110,7 +11165,7 @@ ParmVarDecl *Sema::CheckParameter(DeclContext *DC, SourceLocation StartLoc,
       if (!T.isConstQualified()) {
         DelayedDiagnostics.add(
             sema::DelayedDiagnostic::makeForbiddenType(
-            NameLoc, diag::err_arc_array_param_no_ownership, T, false));
+            Loc, diag::err_arc_array_param_no_ownership, T, false));
       }
       lifetime = Qualifiers::OCL_ExplicitNone;
     } else {
@@ -11118,6 +11173,16 @@ ParmVarDecl *Sema::CheckParameter(DeclContext *DC, SourceLocation StartLoc,
     }
     T = Context.getLifetimeQualifiedType(T, lifetime);
   }
+
+  return T;
+}
+
+ParmVarDecl *Sema::CheckParameter(DeclContext *DC, SourceLocation StartLoc,
+                                  SourceLocation NameLoc, IdentifierInfo *Name,
+                                  QualType T, TypeSourceInfo *TSInfo,
+                                  StorageClass SC) {
+  // Perform Objective-C ARC adjustments.
+  T = adjustParameterTypeForObjCAutoRefCount(T, NameLoc);
 
   ParmVarDecl *New = ParmVarDecl::Create(Context, DC, StartLoc, NameLoc, Name,
                                          Context.getAdjustedParameterType(T),
@@ -15247,7 +15312,10 @@ DeclResult Sema::ActOnModuleImport(SourceLocation AtLoc,
 
 void Sema::ActOnModuleInclude(SourceLocation DirectiveLoc, Module *Mod) {
   checkModuleImportContext(*this, Mod, DirectiveLoc, CurContext, true);
+  BuildModuleInclude(DirectiveLoc, Mod);
+}
 
+void Sema::BuildModuleInclude(SourceLocation DirectiveLoc, Module *Mod) {
   // Determine whether we're in the #include buffer for a module. The #includes
   // in that buffer do not qualify as module imports; they're just an
   // implementation detail of us building the module.
@@ -15287,20 +15355,27 @@ void Sema::ActOnModuleBegin(SourceLocation DirectiveLoc, Module *Mod) {
   VisibleModules.setVisible(Mod, DirectiveLoc);
 }
 
-void Sema::ActOnModuleEnd(SourceLocation DirectiveLoc, Module *Mod) {
-  checkModuleImportContext(*this, Mod, DirectiveLoc, CurContext);
+void Sema::ActOnModuleEnd(SourceLocation EofLoc, Module *Mod) {
+  checkModuleImportContext(*this, Mod, EofLoc, CurContext);
 
   if (getLangOpts().ModulesLocalVisibility) {
-    assert(!ModuleScopes.empty() && ModuleScopes.back().Module == Mod &&
-           "left the wrong module scope");
     VisibleModules = std::move(ModuleScopes.back().OuterVisibleModules);
-    ModuleScopes.pop_back();
-
-    VisibleModules.setVisible(Mod, DirectiveLoc);
     // Leaving a module hides namespace names, so our visible namespace cache
     // is now out of date.
     VisibleNamespaceCache.clear();
   }
+
+  assert(!ModuleScopes.empty() && ModuleScopes.back().Module == Mod &&
+         "left the wrong module scope");
+  ModuleScopes.pop_back();
+
+  // We got to the end of processing a #include of a local module. Create an
+  // ImportDecl as we would for an imported module.
+  FileID File = getSourceManager().getFileID(EofLoc);
+  assert(File != getSourceManager().getMainFileID() &&
+         "end of submodule in main source file");
+  SourceLocation DirectiveLoc = getSourceManager().getIncludeLoc(File);
+  BuildModuleInclude(DirectiveLoc, Mod);
 }
 
 void Sema::createImplicitModuleImportForErrorRecovery(SourceLocation Loc,

@@ -54,6 +54,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include <deque>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -571,6 +572,10 @@ public:
     LateTemplateParserCleanup = LTPCleanup;
     OpaqueParser = P;
   }
+
+  /// \brief Callback to the parser to parse a type expressed as a string.
+  std::function<TypeResult(StringRef, StringRef, SourceLocation)>
+    ParseTypeFromStringCallback;
 
   class DelayedDiagnostics;
 
@@ -1721,6 +1726,8 @@ public:
   /// to a shadowing declaration.
   void CheckShadowingDeclModification(Expr *E, SourceLocation Loc);
 
+  void DiagnoseShadowingLambdaDecls(const sema::LambdaScopeInfo *LSI);
+
 private:
   /// Map of current shadowing declarations to shadowed declarations. Warn if
   /// it looks like the user is trying to modify the shadowing declaration.
@@ -1778,6 +1785,8 @@ public:
   ParmVarDecl *BuildParmVarDeclForTypedef(DeclContext *DC,
                                           SourceLocation Loc,
                                           QualType T);
+  QualType adjustParameterTypeForObjCAutoRefCount(QualType T,
+                                                  SourceLocation Loc);
   ParmVarDecl *CheckParameter(DeclContext *DC, SourceLocation StartLoc,
                               SourceLocation NameLoc, IdentifierInfo *Name,
                               QualType T, TypeSourceInfo *TSInfo,
@@ -1893,6 +1902,7 @@ public:
   /// \brief The parser has processed a module import translated from a
   /// #include or similar preprocessing directive.
   void ActOnModuleInclude(SourceLocation DirectiveLoc, Module *Mod);
+  void BuildModuleInclude(SourceLocation DirectiveLoc, Module *Mod);
 
   /// \brief The parsed has entered a submodule.
   void ActOnModuleBegin(SourceLocation DirectiveLoc, Module *Mod);
@@ -3099,6 +3109,9 @@ public:
   /// method) or an Objective-C property attribute, rather than as an
   /// underscored type specifier.
   ///
+  /// \param allowArrayTypes Whether to accept nullability specifiers on an
+  /// array type (e.g., because it will decay to a pointer).
+  ///
   /// \param overrideExisting Whether to override an existing, locally-specified
   /// nullability specifier rather than complaining about the conflict.
   ///
@@ -3106,6 +3119,7 @@ public:
   bool checkNullabilityTypeSpecifier(QualType &type, NullabilityKind nullability,
                                      SourceLocation nullabilityLoc,
                                      bool isContextSensitive,
+                                     bool allowArrayTypes,
                                      bool implicit,
                                      bool overrideExisting = false);
 
@@ -9798,7 +9812,7 @@ public:
   /// local diagnostics like in reference binding.
   void RefersToMemberWithReducedAlignment(
       Expr *E,
-      std::function<void(Expr *, RecordDecl *, ValueDecl *, CharUnits)> Action);
+      std::function<void(Expr *, RecordDecl *, FieldDecl *, CharUnits)> Action);
 };
 
 /// \brief RAII object that enters a new expression evaluation context.
